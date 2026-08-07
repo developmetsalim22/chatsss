@@ -723,11 +723,14 @@
         // Start Searching
         async function startSearching() {
             try {
+                console.log('Starting search for user:', currentUser.id);
+                
                 // Update user status to searching
                 await window.firebaseUpdateDoc(
                     window.firebaseDoc(window.firebaseDB, 'users', currentUser.id),
                     { status: 'searching', lastSeen: Date.now() }
                 );
+                console.log('User status updated to searching');
                 
                 // Add to queue
                 await window.firebaseSetDoc(
@@ -739,6 +742,7 @@
                         status: 'searching'
                     }
                 );
+                console.log('Added to queue');
                 
                 // Listen for matches
                 listenForMatches();
@@ -747,11 +751,13 @@
                 listenForBeingMatched();
             } catch (error) {
                 console.error('Error starting search:', error);
+                showToast('Error starting search: ' + error.message, 'error');
             }
         }
         
         // Listen for Matches
         function listenForMatches() {
+            console.log('Setting up match listener for user:', currentUser.id);
             const queueRef = window.firebaseCollection(window.firebaseDB, 'queue');
             const q = window.firebaseQuery(
                 queueRef,
@@ -761,9 +767,11 @@
             );
             
             matchUnsubscribe = window.firebaseOnSnapshot(q, async (snapshot) => {
+                console.log('Queue snapshot received, size:', snapshot.size);
                 if (!snapshot.empty && !currentMatch) {
                     const strangerDoc = snapshot.docs[0];
                     const stranger = strangerDoc.data();
+                    console.log('Found stranger:', stranger);
                     
                     // Create match
                     await createMatch(stranger);
@@ -773,21 +781,27 @@
         
         // Listen for being matched by someone else
         function listenForBeingMatched() {
+            console.log('Setting up being matched listener for user:', currentUser.id);
             const userDocRef = window.firebaseDoc(window.firebaseDB, 'users', currentUser.id);
             
             beingMatchedUnsubscribe = window.firebaseOnSnapshot(userDocRef, async (snapshot) => {
                 const userData = snapshot.data();
+                console.log('User data updated:', userData);
                 if (userData && userData.currentMatch && !currentMatch) {
+                    console.log('User was matched! Match ID:', userData.currentMatch);
                     // We were matched by someone else
                     const matchId = userData.currentMatch;
                     const matchDoc = await window.firebaseGetDoc(window.firebaseDoc(window.firebaseDB, 'matches', matchId));
                     const matchData = matchDoc.data();
+                    console.log('Match data:', matchData);
                     
                     if (matchData && matchData.status === 'active') {
                         // Find the other user
                         const otherUserId = matchData.users.find(id => id !== currentUser.id);
+                        console.log('Other user ID:', otherUserId);
                         const otherUserDoc = await window.firebaseGetDoc(window.firebaseDoc(window.firebaseDB, 'users', otherUserId));
                         const otherUser = otherUserDoc.data();
+                        console.log('Other user data:', otherUser);
                         
                         currentMatch = {
                             ...matchData,

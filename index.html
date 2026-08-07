@@ -19,7 +19,7 @@
     <!-- Firebase SDK v10 Modular -->
     <script type="module">
         import { initializeApp } from 'https://www.gstatic.com/firebasejs/10.7.1/firebase-app.js';
-        import { getFirestore, collection, doc, setDoc, getDoc, getDocs, updateDoc, deleteDoc, onSnapshot, query, where, orderBy, limit, addDoc } from 'https://www.gstatic.com/firebasejs/10.7.1/firebase-firestore.js';
+        import { getFirestore, collection, doc, setDoc, getDoc, getDocs, updateDoc, deleteDoc, onSnapshot, query, where, orderBy, limit, addDoc, runTransaction, serverTimestamp, arrayUnion, arrayRemove } from 'https://www.gstatic.com/firebasejs/10.7.1/firebase-firestore.js';
         
         // Firebase Configuration
         const firebaseConfig = {
@@ -51,6 +51,10 @@
         window.firebaseLimit = limit;
         window.firebaseAddDoc = addDoc;
         window.firebaseGetDocs = getDocs;
+        window.firebaseRunTransaction = runTransaction;
+        window.firebaseServerTimestamp = serverTimestamp;
+        window.firebaseArrayUnion = arrayUnion;
+        window.firebaseArrayRemove = arrayRemove;
         
         console.log('Firebase initialized successfully');
     </script>
@@ -537,6 +541,11 @@
                         </div>
                     </div>
                     
+                    <!-- Voice Message Button -->
+                    <button id="voiceBtn" class="rounded-circle d-flex align-items-center justify-content-center" style="width: 40px; height: 40px; background: rgba(255,255,255,0.1); border: none;">
+                        <i class="bi bi-mic-fill fs-5"></i>
+                    </button>
+                    
                     <!-- Text Input -->
                     <input type="text" id="messageInput" placeholder="Type a message..." 
                            class="form-control flex-grow-1"
@@ -547,6 +556,15 @@
                     <button id="sendBtn" class="gradient-btn rounded-circle d-flex align-items-center justify-content-center" style="width: 40px; height: 40px; padding: 0;">
                         <i class="bi bi-send-fill"></i>
                     </button>
+                </div>
+                
+                <!-- Recording Indicator -->
+                <div id="recordingIndicator" class="d-none mt-2 text-center">
+                    <div class="d-inline-flex align-items-center gap-2 text-danger">
+                        <div class="rounded-circle" style="width: 10px; height: 10px; background: #dc3545; animation: pulse 1s infinite;"></div>
+                        <span class="small">Recording... <span id="recordingTime">0:00</span></span>
+                        <button id="stopRecordingBtn" class="btn btn-sm btn-danger ms-2">Stop</button>
+                    </div>
                 </div>
             </div>
         </div>
@@ -571,11 +589,13 @@
     <script type="module">
         // Wait for Firebase to initialize
         window.addEventListener('load', async () => {
+            console.log('Page loaded, waiting for Firebase...');
             // Wait a bit for Firebase to load
             await new Promise(resolve => setTimeout(resolve, 1000));
             
             // Hide splash screen
             document.getElementById('splashScreen').classList.add('d-none');
+            console.log('Splash screen hidden');
             
             // Initialize app
             initApp();
@@ -589,6 +609,14 @@
         let beingMatchedUnsubscribe = null;
         let matchCheckInterval = null;
         let typingTimeout = null;
+        let presenceUnsubscribe = null;
+        let partnerPresenceUnsubscribe = null;
+        let onlineCountUnsubscribe = null;
+        let isSearching = false;
+        let mediaRecorder = null;
+        let audioChunks = [];
+        let recordingStartTime = null;
+        let recordingInterval = null;
         
         // DOM Elements
         const splashScreen = document.getElementById('splashScreen');
@@ -599,27 +627,38 @@
         
         // Initialize App
         function initApp() {
+            console.log('Initializing app...');
+            
             // Check for existing user
             const savedUser = localStorage.getItem('anonchat_user');
             if (savedUser) {
                 currentUser = JSON.parse(savedUser);
+                console.log('Found saved user:', currentUser.id);
                 showWaitingScreen();
             } else {
+                console.log('No saved user, showing profile screen');
                 showProfileScreen();
             }
             
             setupEventListeners();
             startOnlineCountListener();
+            startPresenceSystem();
+            
+            // Handle online/offline status
+            window.addEventListener('online', handleReconnect);
+            window.addEventListener('offline', handleDisconnect);
         }
         
         // Screen Management
         function showProfileScreen() {
+            console.log('Showing profile screen');
             profileScreen.classList.remove('d-none');
             waitingScreen.classList.add('d-none');
             chatScreen.classList.add('d-none');
         }
         
         function showWaitingScreen() {
+            console.log('Showing waiting screen');
             profileScreen.classList.add('d-none');
             waitingScreen.classList.remove('d-none');
             chatScreen.classList.add('d-none');
@@ -627,6 +666,7 @@
         }
         
         function showChatScreen() {
+            console.log('Showing chat screen');
             profileScreen.classList.add('d-none');
             waitingScreen.classList.add('d-none');
             chatScreen.classList.remove('d-none');
@@ -634,6 +674,7 @@
         
         // Event Listeners
         function setupEventListeners() {
+            console.log('Setting up event listeners');
             document.getElementById('createProfileBtn').addEventListener('click', createProfile);
             
             // Matching
@@ -648,6 +689,10 @@
                 sendTypingIndicator();
             });
             
+            // Voice message
+            document.getElementById('voiceBtn').addEventListener('click', startRecording);
+            document.getElementById('stopRecordingBtn').addEventListener('click', stopRecording);
+            
             // Emoji
             document.getElementById('emojiBtn').addEventListener('click', () => {
                 document.getElementById('emojiPicker').classList.toggle('d-none');
@@ -660,7 +705,6 @@
                     input.focus();
                 });
             });
-            
             
             // Close emoji picker when clicking outside
             document.addEventListener('click', (e) => {
@@ -675,6 +719,7 @@
         
         // Create Profile
         async function createProfile() {
+            console.log('Creating profile...');
             const displayName = document.getElementById('displayName').value.trim();
             
             if (!displayName) {
@@ -682,15 +727,10 @@
                 return;
             }
             
-            // Check if Firebase is initialized
-            if (!window.firebaseDB) {
-                showToast('Firebase not initialized. Please refresh the page.', 'error');
-                console.error('Firebase DB not available');
-                return;
-            }
-            
             try {
                 const userId = generateUserId();
+                console.log('Generated user ID:', userId);
+                
                 const user = {
                     id: userId,
                     displayName,
@@ -704,15 +744,17 @@
                     window.firebaseDoc(window.firebaseDB, 'users', userId),
                     user
                 );
+                console.log('User saved to Firestore');
                 
                 currentUser = user;
                 localStorage.setItem('anonchat_user', JSON.stringify(user));
+                console.log('User saved to localStorage');
                 
                 showToast('Profile created successfully!', 'success');
                 showWaitingScreen();
             } catch (error) {
                 console.error('Error creating profile:', error);
-                showToast(`Failed to create profile: ${error.message}`, 'error');
+                showToast('Failed to create profile', 'error');
             }
         }
         
@@ -723,15 +765,20 @@
         
         // Start Searching
         async function startSearching() {
+            if (isSearching) {
+                console.log('Already searching, skipping');
+                return;
+            }
+            
+            isSearching = true;
+            console.log('Starting search for user:', currentUser.id);
+            
             try {
-                console.log('Starting search for user:', currentUser.id);
-                
                 // Update user status to searching
                 await window.firebaseUpdateDoc(
                     window.firebaseDoc(window.firebaseDB, 'users', currentUser.id),
                     { status: 'searching', lastSeen: Date.now() }
                 );
-                console.log('User status updated to searching');
                 
                 // Add to queue
                 await window.firebaseSetDoc(
@@ -743,7 +790,7 @@
                         status: 'searching'
                     }
                 );
-                console.log('Added to queue');
+                console.log('User joined queue');
                 
                 // Start periodic check for matches
                 matchCheckInterval = setInterval(checkForExistingMatches, 2000);
@@ -756,13 +803,16 @@
                 
                 // Listen for being matched by someone else
                 listenForBeingMatched();
+                
+                console.log('Searching...');
             } catch (error) {
                 console.error('Error starting search:', error);
                 showToast('Error starting search: ' + error.message, 'error');
+                isSearching = false;
             }
         }
         
-        // Check for existing matches immediately
+        // Check for existing matches immediately using transaction
         async function checkForExistingMatches() {
             try {
                 // Stop if already matched
@@ -771,23 +821,99 @@
                     return;
                 }
                 
+                console.log('Checking for existing matches...');
+                
                 const queueRef = window.firebaseCollection(window.firebaseDB, 'queue');
                 const q = window.firebaseQuery(
                     queueRef,
                     window.firebaseWhere('userId', '!=', currentUser.id),
                     window.firebaseWhere('status', '==', 'searching'),
+                    window.firebaseOrderBy('timestamp', 'asc'),
                     window.firebaseLimit(1)
                 );
                 
                 const snapshot = await window.firebaseGetDocs(q);
-                console.log('Immediate check for matches, found:', snapshot.size);
+                console.log('Queue check found:', snapshot.size, 'users');
                 
-                if (!snapshot.empty && !currentMatch) {
+                if (snapshot.empty) {
+                    // Only one user online
+                    document.querySelector('#waitingScreen h2').textContent = 'Waiting for another user...';
+                    return;
+                }
+                
+                if (!currentMatch) {
                     const strangerDoc = snapshot.docs[0];
                     const stranger = strangerDoc.data();
-                    console.log('Found stranger immediately:', stranger);
-                    clearInterval(matchCheckInterval);
-                    await createMatch(stranger);
+                    console.log('Found stranger:', stranger.userId);
+                    
+                    // Use transaction to prevent duplicate matches
+                    await window.firebaseRunTransaction(window.firebaseDB, async (transaction) => {
+                        console.log('Starting transaction to create match');
+                        
+                        // Check if both users are still in queue
+                        const currentUserQueueRef = window.firebaseDoc(window.firebaseDB, 'queue', currentUser.id);
+                        const strangerQueueRef = window.firebaseDoc(window.firebaseDB, 'queue', stranger.userId);
+                        
+                        const currentUserQueueDoc = await transaction.get(currentUserQueueRef);
+                        const strangerQueueDoc = await transaction.get(strangerQueueRef);
+                        
+                        if (!currentUserQueueDoc.exists() || !strangerQueueDoc.exists()) {
+                            console.log('One or both users no longer in queue, aborting match');
+                            throw new Error('Users no longer in queue');
+                        }
+                        
+                        // Check if users are already matched
+                        const currentUserRef = window.firebaseDoc(window.firebaseDB, 'users', currentUser.id);
+                        const strangerRef = window.firebaseDoc(window.firebaseDB, 'users', stranger.userId);
+                        
+                        const currentUserDoc = await transaction.get(currentUserRef);
+                        const strangerDocData = await transaction.get(strangerRef);
+                        
+                        if (currentUserDoc.data().currentMatch || strangerDocData.data().currentMatch) {
+                            console.log('One or both users already matched, aborting');
+                            throw new Error('Users already matched');
+                        }
+                        
+                        // Create match
+                        const matchId = generateMatchId();
+                        console.log('Creating match:', matchId);
+                        
+                        const matchRef = window.firebaseDoc(window.firebaseDB, 'matches', matchId);
+                        transaction.set(matchRef, {
+                            id: matchId,
+                            users: [currentUser.id, stranger.userId],
+                            createdAt: Date.now(),
+                            status: 'active'
+                        });
+                        
+                        // Update both users' status
+                        transaction.update(currentUserRef, {
+                            status: 'connected',
+                            currentMatch: matchId,
+                            lastSeen: Date.now()
+                        });
+                        
+                        transaction.update(strangerRef, {
+                            status: 'connected',
+                            currentMatch: matchId,
+                            lastSeen: Date.now()
+                        });
+                        
+                        // Remove from queue
+                        transaction.delete(currentUserQueueRef);
+                        transaction.delete(strangerQueueRef);
+                        
+                        console.log('Match created successfully in transaction');
+                        
+                        return { matchId, stranger };
+                    }).then(async (result) => {
+                        console.log('Transaction completed, match created:', result.matchId);
+                        clearInterval(matchCheckInterval);
+                        await handleMatchCreated(result.matchId, result.stranger);
+                    }).catch((error) => {
+                        console.log('Transaction failed or aborted:', error.message);
+                        // Transaction failed, will try again on next interval
+                    });
                 }
             } catch (error) {
                 console.error('Error checking for existing matches:', error);
@@ -802,18 +928,25 @@
                 queueRef,
                 window.firebaseWhere('userId', '!=', currentUser.id),
                 window.firebaseWhere('status', '==', 'searching'),
+                window.firebaseOrderBy('timestamp', 'asc'),
                 window.firebaseLimit(1)
             );
             
             matchUnsubscribe = window.firebaseOnSnapshot(q, async (snapshot) => {
                 console.log('Queue snapshot received, size:', snapshot.size);
+                
+                if (snapshot.empty) {
+                    document.querySelector('#waitingScreen h2').textContent = 'Waiting for another user...';
+                    return;
+                }
+                
                 if (!snapshot.empty && !currentMatch) {
                     const strangerDoc = snapshot.docs[0];
                     const stranger = strangerDoc.data();
-                    console.log('Found stranger:', stranger);
+                    console.log('Found stranger in listener:', stranger.userId);
                     
-                    // Create match
-                    await createMatch(stranger);
+                    // Trigger match check
+                    await checkForExistingMatches();
                 }
             });
         }
@@ -825,9 +958,11 @@
             
             beingMatchedUnsubscribe = window.firebaseOnSnapshot(userDocRef, async (snapshot) => {
                 const userData = snapshot.data();
-                console.log('User data updated:', userData);
+                console.log('User data updated:', userData?.status, userData?.currentMatch);
+                
                 if (userData && userData.currentMatch && !currentMatch) {
-                    console.log('User was matched! Match ID:', userData.currentMatch);
+                    console.log('User was matched by someone else! Match ID:', userData.currentMatch);
+                    
                     // We were matched by someone else
                     const matchId = userData.currentMatch;
                     const matchDoc = await window.firebaseGetDoc(window.firebaseDoc(window.firebaseDB, 'matches', matchId));
@@ -838,9 +973,12 @@
                         // Find the other user
                         const otherUserId = matchData.users.find(id => id !== currentUser.id);
                         console.log('Other user ID:', otherUserId);
+                        
                         const otherUserDoc = await window.firebaseGetDoc(window.firebaseDoc(window.firebaseDB, 'users', otherUserId));
                         const otherUser = otherUserDoc.data();
                         console.log('Other user data:', otherUser);
+                        
+                        clearInterval(matchCheckInterval);
                         
                         currentMatch = {
                             ...matchData,
@@ -850,15 +988,19 @@
                             }
                         };
                         
+                        console.log('Partner found:', currentMatch.partner);
+                        
                         // Stop listening for matches
                         if (matchUnsubscribe) {
                             matchUnsubscribe();
                             matchUnsubscribe = null;
                         }
                         
+                        isSearching = false;
                         showChatScreen();
                         updatePartnerInfo(currentMatch.partner);
                         listenForMessages(matchId);
+                        listenForPartnerPresence(otherUserId);
                         
                         showToast('Connected with a stranger!', 'success');
                     }
@@ -866,64 +1008,39 @@
             });
         }
         
-        // Create Match
-        async function createMatch(stranger) {
-            try {
-                const matchId = generateMatchId();
-                
-                const match = {
-                    id: matchId,
-                    users: [currentUser.id, stranger.userId],
-                    createdAt: Date.now(),
-                    status: 'active'
-                };
-                
-                // Create match document
-                await window.firebaseSetDoc(
-                    window.firebaseDoc(window.firebaseDB, 'matches', matchId),
-                    match
-                );
-                
-                // Update both users' status
-                await window.firebaseUpdateDoc(
-                    window.firebaseDoc(window.firebaseDB, 'users', currentUser.id),
-                    { status: 'connected', currentMatch: matchId }
-                );
-                
-                await window.firebaseUpdateDoc(
-                    window.firebaseDoc(window.firebaseDB, 'users', stranger.userId),
-                    { status: 'connected', currentMatch: matchId }
-                );
-                
-                // Remove from queue
-                await window.firebaseDeleteDoc(
-                    window.firebaseDoc(window.firebaseDB, 'queue', currentUser.id)
-                );
-                
-                await window.firebaseDeleteDoc(
-                    window.firebaseDoc(window.firebaseDB, 'queue', stranger.userId)
-                );
-                
-                currentMatch = {
-                    ...match,
-                    partner: stranger
-                };
-                
-                // Stop listening for matches
-                if (matchUnsubscribe) {
-                    matchUnsubscribe();
-                    matchUnsubscribe = null;
-                }
-                
-                // Show chat screen
-                showChatScreen();
-                updatePartnerInfo(stranger);
-                listenForMessages(matchId);
-                
-                showToast('Connected with a stranger!', 'success');
-            } catch (error) {
-                console.error('Error creating match:', error);
+        // Handle match created (when we initiated the match)
+        async function handleMatchCreated(matchId, stranger) {
+            console.log('Handling match created:', matchId);
+            
+            // Get the match document
+            const matchDoc = await window.firebaseGetDoc(window.firebaseDoc(window.firebaseDB, 'matches', matchId));
+            const matchData = matchDoc.data();
+            
+            currentMatch = {
+                ...matchData,
+                partner: stranger
+            };
+            
+            console.log('Current match set:', currentMatch);
+            
+            // Stop listening for matches
+            if (matchUnsubscribe) {
+                matchUnsubscribe();
+                matchUnsubscribe = null;
             }
+            
+            if (beingMatchedUnsubscribe) {
+                beingMatchedUnsubscribe();
+                beingMatchedUnsubscribe = null;
+            }
+            
+            isSearching = false;
+            showChatScreen();
+            updatePartnerInfo(stranger);
+            listenForMessages(matchId);
+            listenForPartnerPresence(stranger.userId);
+            
+            showToast('Connected with a stranger!', 'success');
         }
         
         // Generate Match ID
@@ -933,11 +1050,13 @@
         
         // Update Partner Info
         function updatePartnerInfo(partner) {
+            console.log('Updating partner info:', partner.displayName);
             document.getElementById('partnerName').textContent = partner.displayName || 'Stranger';
         }
         
         // Listen for Messages
         function listenForMessages(matchId) {
+            console.log('Listening for messages in match:', matchId);
             const messagesRef = window.firebaseCollection(window.firebaseDB, 'messages');
             const q = window.firebaseQuery(
                 messagesRef,
@@ -951,25 +1070,68 @@
                     messages.push({ id: doc.id, ...doc.data() });
                 });
                 
+                console.log('Messages received:', messages.length);
                 renderMessages(messages);
+                
+                // Mark messages as seen if they're from partner
+                markMessagesAsSeen(messages);
             });
+        }
+        
+        // Mark messages as seen
+        async function markMessagesAsSeen(messages) {
+            const unseenMessages = messages.filter(msg => 
+                msg.senderId !== currentUser.id && !msg.seen
+            );
+            
+            if (unseenMessages.length > 0) {
+                console.log('Marking', unseenMessages.length, 'messages as seen');
+                for (const msg of unseenMessages) {
+                    await window.firebaseUpdateDoc(
+                        window.firebaseDoc(window.firebaseDB, 'messages', msg.id),
+                        { seen: true }
+                    );
+                }
+            }
         }
         
         // Render Messages
         function renderMessages(messages) {
             const container = document.getElementById('chatMessages');
-            const emptyState = document.getElementById('emptyChat');
             
             if (messages.length === 0) {
-                emptyState.classList.remove('d-none');
+                container.innerHTML = `
+                    <div id="emptyChat" class="empty-state h-full">
+                        <div class="text-6xl mb-4">💬</div>
+                        <h3 class="text-xl font-semibold mb-2">Start the conversation!</h3>
+                        <p class="text-gray-400">Say hello to your new chat partner</p>
+                    </div>
+                `;
                 return;
             }
-            
-            emptyState.classList.add('d-none');
             
             container.innerHTML = messages.map(msg => {
                 const isSent = msg.senderId === currentUser.id;
                 const time = new Date(msg.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+                
+                if (msg.type === 'voice') {
+                    return `
+                        <div class="d-flex ${isSent ? 'justify-content-end' : 'justify-content-start'} message-enter">
+                            <div class="chat-bubble ${isSent ? 'sent' : 'received'}">
+                                <div class="d-flex align-items-center gap-2">
+                                    <button class="btn btn-sm btn-light" onclick="playVoiceMessage('${msg.audioUrl}')">
+                                        <i class="bi bi-play-fill"></i>
+                                    </button>
+                                    <span>Voice message</span>
+                                </div>
+                                <div class="d-flex align-items-center gap-2 mt-2 small ${isSent ? 'text-purple-200' : 'text-secondary'}">
+                                    <span>${time}</span>
+                                    ${msg.seen ? '<span>✓✓</span>' : ''}
+                                </div>
+                            </div>
+                        </div>
+                    `;
+                }
                 
                 return `
                     <div class="d-flex ${isSent ? 'justify-content-end' : 'justify-content-start'} message-enter">
@@ -995,6 +1157,8 @@
             
             if (!text || !currentMatch) return;
             
+            console.log('Sending message');
+            
             try {
                 const message = {
                     matchId: currentMatch.id,
@@ -1010,6 +1174,7 @@
                     message
                 );
                 
+                console.log('Message sent');
                 input.value = '';
             } catch (error) {
                 console.error('Error sending message:', error);
@@ -1020,6 +1185,8 @@
         // Send Typing Indicator
         function sendTypingIndicator() {
             if (!currentMatch) return;
+            
+            console.log('Sending typing indicator');
             
             // Update presence with typing status
             window.firebaseUpdateDoc(
@@ -1036,9 +1203,95 @@
             }, 3000);
         }
         
+        // Listen for partner presence
+        function listenForPartnerPresence(partnerId) {
+            console.log('Listening for partner presence:', partnerId);
+            
+            if (partnerPresenceUnsubscribe) {
+                partnerPresenceUnsubscribe();
+            }
+            
+            const partnerPresenceRef = window.firebaseDoc(window.firebaseDB, 'presence', partnerId);
+            
+            partnerPresenceUnsubscribe = window.firebaseOnSnapshot(partnerPresenceRef, (snapshot) => {
+                const data = snapshot.data();
+                if (data) {
+                    // Update typing indicator
+                    const typingIndicator = document.getElementById('typingIndicator');
+                    if (data.typing) {
+                        typingIndicator.classList.remove('d-none');
+                    } else {
+                        typingIndicator.classList.add('d-none');
+                    }
+                    
+                    // Update online status
+                    const partnerStatus = document.getElementById('partnerStatus');
+                    const partnerOnlineDot = document.getElementById('partnerOnlineDot');
+                    
+                    const isOnline = Date.now() - data.lastSeen < 30000; // Online if seen within 30 seconds
+                    
+                    if (isOnline) {
+                        partnerStatus.textContent = 'Online';
+                        partnerOnlineDot.style.background = '#22c55e';
+                    } else {
+                        partnerStatus.textContent = 'Offline';
+                        partnerOnlineDot.style.background = '#6c757d';
+                    }
+                }
+            });
+        }
+        
+        // Start Presence System
+        function startPresenceSystem() {
+            console.log('Starting presence system');
+            
+            // Update presence every 10 seconds
+            setInterval(async () => {
+                if (currentUser) {
+                    await window.firebaseSetDoc(
+                        window.firebaseDoc(window.firebaseDB, 'presence', currentUser.id),
+                        {
+                            online: true,
+                            lastSeen: Date.now(),
+                            typing: false
+                        }
+                    );
+                }
+            }, 10000);
+            
+            // Initial presence update
+            if (currentUser) {
+                window.firebaseSetDoc(
+                    window.firebaseDoc(window.firebaseDB, 'presence', currentUser.id),
+                    {
+                        online: true,
+                        lastSeen: Date.now(),
+                        typing: false
+                    }
+                );
+            }
+        }
+        
+        // Online Count Listener
+        function startOnlineCountListener() {
+            console.log('Starting online count listener');
+            
+            const presenceRef = window.firebaseCollection(window.firebaseDB, 'presence');
+            const q = window.firebaseQuery(
+                presenceRef,
+                window.firebaseWhere('online', '==', true)
+            );
+            
+            onlineCountUnsubscribe = window.firebaseOnSnapshot(q, (snapshot) => {
+                const count = snapshot.size;
+                document.getElementById('onlineCount').textContent = `${count} users online`;
+                console.log('Online count updated:', count);
+            });
+        }
         
         // Next Chat
         function nextChat() {
+            console.log('Next clicked');
             if (currentMatch) {
                 endCurrentMatch();
             }
@@ -1047,15 +1300,17 @@
         
         // Stop Chat
         function stopChat() {
+            console.log('Stop clicked');
             if (currentMatch) {
                 endCurrentMatch();
             }
-            showWaitingScreen();
+            showProfileScreen();
         }
         
         // Delete all messages for a match
         async function deleteMatchMessages(matchId) {
             try {
+                console.log('Deleting messages for match:', matchId);
                 const messagesRef = window.firebaseCollection(window.firebaseDB, 'messages');
                 const q = window.firebaseQuery(
                     messagesRef,
@@ -1070,6 +1325,7 @@
                 });
                 
                 await Promise.all(deletePromises);
+                console.log('Messages deleted');
             } catch (error) {
                 console.error('Error deleting messages:', error);
             }
@@ -1079,6 +1335,8 @@
         async function endCurrentMatch() {
             if (!currentMatch) return;
             
+            console.log('Ending current match:', currentMatch.id);
+            
             try {
                 // Delete all messages for privacy
                 await deleteMatchMessages(currentMatch.id);
@@ -1087,17 +1345,24 @@
                 await window.firebaseDeleteDoc(
                     window.firebaseDoc(window.firebaseDB, 'matches', currentMatch.id)
                 );
+                console.log('Match deleted');
                 
                 // Update user status
                 await window.firebaseUpdateDoc(
                     window.firebaseDoc(window.firebaseDB, 'users', currentUser.id),
-                    { status: 'online', currentMatch: null }
+                    { status: 'online', currentMatch: null, lastSeen: Date.now() }
                 );
                 
                 // Unsubscribe from messages
                 if (messagesUnsubscribe) {
                     messagesUnsubscribe();
                     messagesUnsubscribe = null;
+                }
+                
+                // Unsubscribe from partner presence
+                if (partnerPresenceUnsubscribe) {
+                    partnerPresenceUnsubscribe();
+                    partnerPresenceUnsubscribe = null;
                 }
                 
                 // Clear chat
@@ -1110,6 +1375,7 @@
                 `;
                 
                 currentMatch = null;
+                console.log('Match ended');
             } catch (error) {
                 console.error('Error ending match:', error);
             }
@@ -1117,6 +1383,9 @@
         
         // Stop Searching
         async function stopSearching() {
+            console.log('Stop searching clicked');
+            isSearching = false;
+            
             try {
                 // Clear match check interval
                 if (matchCheckInterval) {
@@ -1128,11 +1397,12 @@
                 await window.firebaseDeleteDoc(
                     window.firebaseDoc(window.firebaseDB, 'queue', currentUser.id)
                 );
+                console.log('Removed from queue');
                 
                 // Update user status
                 await window.firebaseUpdateDoc(
                     window.firebaseDoc(window.firebaseDB, 'users', currentUser.id),
-                    { status: 'online' }
+                    { status: 'online', lastSeen: Date.now() }
                 );
                 
                 // Unsubscribe from matches
@@ -1153,37 +1423,82 @@
             }
         }
         
-        // Online Count Listener
-        function startOnlineCountListener() {
-            const usersRef = window.firebaseCollection(window.firebaseDB, 'users');
-            const q = window.firebaseQuery(
-                usersRef,
-                window.firebaseWhere('status', 'in', ['online', 'searching', 'connected'])
-            );
+        // Handle Reconnect
+        async function handleReconnect() {
+            console.log('Internet reconnected');
+            showToast('Internet reconnected', 'success');
             
-            window.firebaseOnSnapshot(q, (snapshot) => {
-                const count = snapshot.size;
-                document.getElementById('onlineCount').textContent = `${count} users online`;
-            });
+            // Update presence
+            if (currentUser) {
+                await window.firebaseUpdateDoc(
+                    window.firebaseDoc(window.firebaseDB, 'users', currentUser.id),
+                    { lastSeen: Date.now() }
+                );
+                
+                await window.firebaseSetDoc(
+                    window.firebaseDoc(window.firebaseDB, 'presence', currentUser.id),
+                    { online: true, lastSeen: Date.now(), typing: false }
+                );
+            }
+            
+            // If we were in a match, try to reconnect
+            if (currentMatch) {
+                listenForMessages(currentMatch.id);
+            }
+        }
+        
+        // Handle Disconnect
+        async function handleDisconnect() {
+            console.log('Internet disconnected');
+            showToast('Internet disconnected', 'error');
+            
+            // Update last seen
+            if (currentUser) {
+                await window.firebaseUpdateDoc(
+                    window.firebaseDoc(window.firebaseDB, 'users', currentUser.id),
+                    { lastSeen: Date.now() }
+                );
+            }
         }
         
         // Cleanup
         async function cleanup() {
+            console.log('Cleaning up...');
+            
             if (currentMatch) {
                 await endCurrentMatch();
             }
             
             try {
-                // Remove from queue
-                await window.firebaseDeleteDoc(
-                    window.firebaseDoc(window.firebaseDB, 'queue', currentUser.id)
-                );
+                // Remove from queue (if exists)
+                try {
+                    await window.firebaseDeleteDoc(
+                        window.firebaseDoc(window.firebaseDB, 'queue', currentUser.id)
+                    );
+                    console.log('Removed from queue during cleanup');
+                } catch (e) {
+                    // Queue document might not exist, that's okay
+                    console.log('Queue document did not exist or already removed');
+                }
                 
                 // Update user status
                 await window.firebaseUpdateDoc(
                     window.firebaseDoc(window.firebaseDB, 'users', currentUser.id),
                     { status: 'offline', lastSeen: Date.now() }
                 );
+                
+                // Remove presence (if exists)
+                try {
+                    await window.firebaseDeleteDoc(
+                        window.firebaseDoc(window.firebaseDB, 'presence', currentUser.id)
+                    );
+                    console.log('Removed presence during cleanup');
+                } catch (e) {
+                    // Presence document might not exist, that's okay
+                    console.log('Presence document did not exist or already removed');
+                }
+                
+                console.log('Cleanup complete');
             } catch (error) {
                 console.error('Error during cleanup:', error);
             }
@@ -1218,29 +1533,143 @@
             return div.innerHTML;
         }
         
+        // Start Recording
+        async function startRecording() {
+            console.log('Starting voice recording');
+            
+            try {
+                const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+                mediaRecorder = new MediaRecorder(stream);
+                audioChunks = [];
+                
+                mediaRecorder.ondataavailable = (event) => {
+                    audioChunks.push(event.data);
+                };
+                
+                mediaRecorder.onstop = async () => {
+                    console.log('Recording stopped');
+                    const audioBlob = new Blob(audioChunks, { type: 'audio/webm' });
+                    const audioUrl = URL.createObjectURL(audioBlob);
+                    
+                    // Convert to base64 for storage
+                    const reader = new FileReader();
+                    reader.readAsDataURL(audioBlob);
+                    reader.onloadend = async () => {
+                        const base64Audio = reader.result;
+                        await sendVoiceMessage(base64Audio);
+                    };
+                    
+                    // Stop all tracks
+                    stream.getTracks().forEach(track => track.stop());
+                };
+                
+                mediaRecorder.start();
+                recordingStartTime = Date.now();
+                
+                // Show recording indicator
+                document.getElementById('recordingIndicator').classList.remove('d-none');
+                
+                // Update recording time
+                recordingInterval = setInterval(updateRecordingTime, 1000);
+                
+                console.log('Recording started');
+            } catch (error) {
+                console.error('Error starting recording:', error);
+                showToast('Could not access microphone', 'error');
+            }
+        }
+        
+        // Stop Recording
+        function stopRecording() {
+            console.log('Stopping recording');
+            
+            if (mediaRecorder && mediaRecorder.state !== 'inactive') {
+                mediaRecorder.stop();
+            }
+            
+            // Hide recording indicator
+            document.getElementById('recordingIndicator').classList.add('d-none');
+            
+            // Clear interval
+            if (recordingInterval) {
+                clearInterval(recordingInterval);
+                recordingInterval = null;
+            }
+        }
+        
+        // Update Recording Time
+        function updateRecordingTime() {
+            const elapsed = Math.floor((Date.now() - recordingStartTime) / 1000);
+            const minutes = Math.floor(elapsed / 60);
+            const seconds = elapsed % 60;
+            document.getElementById('recordingTime').textContent = `${minutes}:${seconds.toString().padStart(2, '0')}`;
+        }
+        
+        // Send Voice Message
+        async function sendVoiceMessage(base64Audio) {
+            if (!currentMatch) return;
+            
+            console.log('Sending voice message');
+            
+            try {
+                const message = {
+                    matchId: currentMatch.id,
+                    senderId: currentUser.id,
+                    audioUrl: base64Audio,
+                    type: 'voice',
+                    timestamp: Date.now(),
+                    seen: false
+                };
+                
+                await window.firebaseAddDoc(
+                    window.firebaseCollection(window.firebaseDB, 'messages'),
+                    message
+                );
+                
+                console.log('Voice message sent');
+            } catch (error) {
+                console.error('Error sending voice message:', error);
+                showToast('Failed to send voice message', 'error');
+            }
+        }
+        
+        // Play Voice Message
+        window.playVoiceMessage = function(audioUrl) {
+            console.log('Playing voice message');
+            const audio = new Audio(audioUrl);
+            audio.play();
+        };
+        
         // Auto cleanup disconnected users (runs periodically)
         setInterval(async () => {
             try {
                 const fiveMinutesAgo = Date.now() - 5 * 60 * 1000;
-                const usersRef = window.firebaseCollection(window.firebaseDB, 'users');
+                const presenceRef = window.firebaseCollection(window.firebaseDB, 'presence');
                 const q = window.firebaseQuery(
-                    usersRef,
+                    presenceRef,
                     window.firebaseWhere('lastSeen', '<', fiveMinutesAgo)
                 );
                 
                 const snapshot = await window.firebaseGetDocs(q);
+                console.log('Cleaning up', snapshot.size, 'inactive users');
+                
                 snapshot.forEach(async (doc) => {
-                    const user = doc.data();
+                    const userId = doc.id;
                     
                     // Remove from queue
                     await window.firebaseDeleteDoc(
-                        window.firebaseDoc(window.firebaseDB, 'queue', user.id)
+                        window.firebaseDoc(window.firebaseDB, 'queue', userId)
                     );
                     
                     // Update status to offline
                     await window.firebaseUpdateDoc(
-                        window.firebaseDoc(window.firebaseDB, 'users', user.id),
-                        { status: 'offline' }
+                        window.firebaseDoc(window.firebaseDB, 'users', userId),
+                        { status: 'offline', currentMatch: null }
+                    );
+                    
+                    // Remove presence
+                    await window.firebaseDeleteDoc(
+                        window.firebaseDoc(window.firebaseDB, 'presence', userId)
                     );
                 });
             } catch (error) {

@@ -587,6 +587,7 @@
         let matchUnsubscribe = null;
         let messagesUnsubscribe = null;
         let beingMatchedUnsubscribe = null;
+        let matchCheckInterval = null;
         let typingTimeout = null;
         
         // DOM Elements
@@ -744,6 +745,12 @@
                 );
                 console.log('Added to queue');
                 
+                // Start periodic check for matches
+                matchCheckInterval = setInterval(checkForExistingMatches, 2000);
+                
+                // Immediately check for existing users in queue
+                await checkForExistingMatches();
+                
                 // Listen for matches
                 listenForMatches();
                 
@@ -752,6 +759,38 @@
             } catch (error) {
                 console.error('Error starting search:', error);
                 showToast('Error starting search: ' + error.message, 'error');
+            }
+        }
+        
+        // Check for existing matches immediately
+        async function checkForExistingMatches() {
+            try {
+                // Stop if already matched
+                if (currentMatch) {
+                    clearInterval(matchCheckInterval);
+                    return;
+                }
+                
+                const queueRef = window.firebaseCollection(window.firebaseDB, 'queue');
+                const q = window.firebaseQuery(
+                    queueRef,
+                    window.firebaseWhere('userId', '!=', currentUser.id),
+                    window.firebaseWhere('status', '==', 'searching'),
+                    window.firebaseLimit(1)
+                );
+                
+                const snapshot = await window.firebaseGetDocs(q);
+                console.log('Immediate check for matches, found:', snapshot.size);
+                
+                if (!snapshot.empty && !currentMatch) {
+                    const strangerDoc = snapshot.docs[0];
+                    const stranger = strangerDoc.data();
+                    console.log('Found stranger immediately:', stranger);
+                    clearInterval(matchCheckInterval);
+                    await createMatch(stranger);
+                }
+            } catch (error) {
+                console.error('Error checking for existing matches:', error);
             }
         }
         
@@ -1079,6 +1118,12 @@
         // Stop Searching
         async function stopSearching() {
             try {
+                // Clear match check interval
+                if (matchCheckInterval) {
+                    clearInterval(matchCheckInterval);
+                    matchCheckInterval = null;
+                }
+                
                 // Remove from queue
                 await window.firebaseDeleteDoc(
                     window.firebaseDoc(window.firebaseDB, 'queue', currentUser.id)

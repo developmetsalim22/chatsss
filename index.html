@@ -634,7 +634,8 @@
             if (savedUser) {
                 currentUser = JSON.parse(savedUser);
                 console.log('Found saved user:', currentUser.id);
-                showWaitingScreen();
+                showChatScreen();
+                startSearchingInBackground();
             } else {
                 console.log('No saved user, showing profile screen');
                 showProfileScreen();
@@ -751,7 +752,8 @@
                 console.log('User saved to localStorage');
                 
                 showToast('Profile created successfully!', 'success');
-                showWaitingScreen();
+                showChatScreen();
+                startSearchingInBackground();
             } catch (error) {
                 console.error('Error creating profile:', error);
                 showToast('Failed to create profile', 'error');
@@ -761,6 +763,59 @@
         // Generate User ID
         function generateUserId() {
             return 'user_' + Math.random().toString(36).substr(2, 9) + Date.now();
+        }
+        
+        // Start Searching in Background
+        async function startSearchingInBackground() {
+            if (isSearching) {
+                console.log('Already searching in background, skipping');
+                return;
+            }
+            
+            isSearching = true;
+            console.log('Starting background search for user:', currentUser.id);
+            
+            // Update chat header to show searching
+            document.getElementById('partnerName').textContent = 'Searching...';
+            document.getElementById('partnerStatus').textContent = 'Looking for partner';
+            
+            try {
+                // Update user status to searching
+                await window.firebaseUpdateDoc(
+                    window.firebaseDoc(window.firebaseDB, 'users', currentUser.id),
+                    { status: 'searching', lastSeen: Date.now() }
+                );
+                console.log('User status updated to searching');
+                
+                // Add to queue
+                await window.firebaseSetDoc(
+                    window.firebaseDoc(window.firebaseDB, 'queue', currentUser.id),
+                    {
+                        userId: currentUser.id,
+                        displayName: currentUser.displayName,
+                        timestamp: Date.now(),
+                        status: 'searching'
+                    }
+                );
+                console.log('User joined queue');
+                
+                // Start periodic check for matches
+                matchCheckInterval = setInterval(checkForExistingMatches, 2000);
+                
+                // Immediately check for existing users in queue
+                await checkForExistingMatches();
+                
+                // Listen for matches
+                listenForMatches();
+                
+                // Listen for being matched by someone else
+                listenForBeingMatched();
+                
+                console.log('Background searching...');
+            } catch (error) {
+                console.error('Error starting background search:', error);
+                isSearching = false;
+            }
         }
         
         // Start Searching
@@ -1087,13 +1142,23 @@
             const container = document.getElementById('chatMessages');
             
             if (messages.length === 0) {
-                container.innerHTML = `
-                    <div id="emptyChat" class="empty-state h-full">
-                        <div class="text-6xl mb-4">💬</div>
-                        <h3 class="text-xl font-semibold mb-2">Start the conversation!</h3>
-                        <p class="text-gray-400">Say hello to your new chat partner</p>
-                    </div>
-                `;
+                if (currentMatch) {
+                    container.innerHTML = `
+                        <div id="emptyChat" class="empty-state h-full">
+                            <div class="text-6xl mb-4">💬</div>
+                            <h3 class="text-xl font-semibold mb-2">Start the conversation!</h3>
+                            <p class="text-gray-400">Say hello to your new chat partner</p>
+                        </div>
+                    `;
+                } else {
+                    container.innerHTML = `
+                        <div id="emptyChat" class="empty-state h-full">
+                            <div class="text-6xl mb-4">🔍</div>
+                            <h3 class="text-xl font-semibold mb-2">Waiting for partner...</h3>
+                            <p class="text-gray-400">Looking for someone to chat with</p>
+                        </div>
+                    `;
+                }
                 return;
             }
             
@@ -1282,7 +1347,8 @@
             if (currentMatch) {
                 endCurrentMatch();
             }
-            showWaitingScreen();
+            // Stay on chat screen and search in background
+            startSearchingInBackground();
         }
         
         // Stop Chat

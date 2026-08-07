@@ -812,7 +812,7 @@
             }
         }
         
-        // Check for existing matches immediately using transaction
+        // Check for existing matches immediately - simplified version
         async function checkForExistingMatches() {
             try {
                 // Stop if already matched
@@ -846,77 +846,99 @@
                     const stranger = strangerDoc.data();
                     console.log('Found stranger:', stranger.userId);
                     
-                    // Use transaction to prevent duplicate matches
-                    await window.firebaseRunTransaction(window.firebaseDB, async (transaction) => {
-                        console.log('Starting transaction to create match');
-                        
-                        // Check if both users are still in queue
-                        const currentUserQueueRef = window.firebaseDoc(window.firebaseDB, 'queue', currentUser.id);
-                        const strangerQueueRef = window.firebaseDoc(window.firebaseDB, 'queue', stranger.userId);
-                        
-                        const currentUserQueueDoc = await transaction.get(currentUserQueueRef);
-                        const strangerQueueDoc = await transaction.get(strangerQueueRef);
-                        
-                        if (!currentUserQueueDoc.exists() || !strangerQueueDoc.exists()) {
-                            console.log('One or both users no longer in queue, aborting match');
-                            throw new Error('Users no longer in queue');
-                        }
-                        
-                        // Check if users are already matched
-                        const currentUserRef = window.firebaseDoc(window.firebaseDB, 'users', currentUser.id);
-                        const strangerRef = window.firebaseDoc(window.firebaseDB, 'users', stranger.userId);
-                        
-                        const currentUserDoc = await transaction.get(currentUserRef);
-                        const strangerDocData = await transaction.get(strangerRef);
-                        
-                        if (currentUserDoc.data().currentMatch || strangerDocData.data().currentMatch) {
-                            console.log('One or both users already matched, aborting');
-                            throw new Error('Users already matched');
-                        }
-                        
-                        // Create match
-                        const matchId = generateMatchId();
-                        console.log('Creating match:', matchId);
-                        
-                        const matchRef = window.firebaseDoc(window.firebaseDB, 'matches', matchId);
-                        transaction.set(matchRef, {
-                            id: matchId,
-                            users: [currentUser.id, stranger.userId],
-                            createdAt: Date.now(),
-                            status: 'active'
-                        });
-                        
-                        // Update both users' status
-                        transaction.update(currentUserRef, {
-                            status: 'connected',
-                            currentMatch: matchId,
-                            lastSeen: Date.now()
-                        });
-                        
-                        transaction.update(strangerRef, {
-                            status: 'connected',
-                            currentMatch: matchId,
-                            lastSeen: Date.now()
-                        });
-                        
-                        // Remove from queue
-                        transaction.delete(currentUserQueueRef);
-                        transaction.delete(strangerQueueRef);
-                        
-                        console.log('Match created successfully in transaction');
-                        
-                        return { matchId, stranger };
-                    }).then(async (result) => {
-                        console.log('Transaction completed, match created:', result.matchId);
-                        clearInterval(matchCheckInterval);
-                        await handleMatchCreated(result.matchId, result.stranger);
-                    }).catch((error) => {
-                        console.log('Transaction failed or aborted:', error.message);
-                        // Transaction failed, will try again on next interval
-                    });
+                    // Simple direct match creation
+                    await createMatchDirect(stranger);
                 }
             } catch (error) {
                 console.error('Error checking for existing matches:', error);
+            }
+        }
+        
+        // Create match directly without transaction
+        async function createMatchDirect(stranger) {
+            try {
+                console.log('Creating direct match with:', stranger.userId);
+                
+                const matchId = generateMatchId();
+                console.log('Match ID:', matchId);
+                
+                // Create match document
+                await window.firebaseSetDoc(
+                    window.firebaseDoc(window.firebaseDB, 'matches', matchId),
+                    {
+                        id: matchId,
+                        users: [currentUser.id, stranger.userId],
+                        createdAt: Date.now(),
+                        status: 'active'
+                    }
+                );
+                console.log('Match document created');
+                
+                // Update current user status
+                await window.firebaseUpdateDoc(
+                    window.firebaseDoc(window.firebaseDB, 'users', currentUser.id),
+                    {
+                        status: 'connected',
+                        currentMatch: matchId,
+                        lastSeen: Date.now()
+                    }
+                );
+                console.log('Current user status updated');
+                
+                // Update stranger user status
+                await window.firebaseUpdateDoc(
+                    window.firebaseDoc(window.firebaseDB, 'users', stranger.userId),
+                    {
+                        status: 'connected',
+                        currentMatch: matchId,
+                        lastSeen: Date.now()
+                    }
+                );
+                console.log('Stranger user status updated');
+                
+                // Remove current user from queue
+                await window.firebaseDeleteDoc(
+                    window.firebaseDoc(window.firebaseDB, 'queue', currentUser.id)
+                );
+                console.log('Current user removed from queue');
+                
+                // Remove stranger from queue
+                await window.firebaseDeleteDoc(
+                    window.firebaseDoc(window.firebaseDB, 'queue', stranger.userId)
+                );
+                console.log('Stranger removed from queue');
+                
+                clearInterval(matchCheckInterval);
+                
+                currentMatch = {
+                    id: matchId,
+                    users: [currentUser.id, stranger.userId],
+                    createdAt: Date.now(),
+                    status: 'active',
+                    partner: stranger
+                };
+                
+                console.log('Match created successfully');
+                
+                // Stop listeners
+                if (matchUnsubscribe) {
+                    matchUnsubscribe();
+                    matchUnsubscribe = null;
+                }
+                if (beingMatchedUnsubscribe) {
+                    beingMatchedUnsubscribe();
+                    beingMatchedUnsubscribe = null;
+                }
+                
+                isSearching = false;
+                showChatScreen();
+                updatePartnerInfo(stranger);
+                listenForMessages(matchId);
+                listenForPartnerPresence(stranger.userId);
+                
+                showToast('Connected with a stranger!', 'success');
+            } catch (error) {
+                console.error('Error creating direct match:', error);
             }
         }
         
@@ -945,8 +967,8 @@
                     const stranger = strangerDoc.data();
                     console.log('Found stranger in listener:', stranger.userId);
                     
-                    // Trigger match check
-                    await checkForExistingMatches();
+                    // Create match directly
+                    await createMatchDirect(stranger);
                 }
             });
         }
@@ -1006,41 +1028,6 @@
                     }
                 }
             });
-        }
-        
-        // Handle match created (when we initiated the match)
-        async function handleMatchCreated(matchId, stranger) {
-            console.log('Handling match created:', matchId);
-            
-            // Get the match document
-            const matchDoc = await window.firebaseGetDoc(window.firebaseDoc(window.firebaseDB, 'matches', matchId));
-            const matchData = matchDoc.data();
-            
-            currentMatch = {
-                ...matchData,
-                partner: stranger
-            };
-            
-            console.log('Current match set:', currentMatch);
-            
-            // Stop listening for matches
-            if (matchUnsubscribe) {
-                matchUnsubscribe();
-                matchUnsubscribe = null;
-            }
-            
-            if (beingMatchedUnsubscribe) {
-                beingMatchedUnsubscribe();
-                beingMatchedUnsubscribe = null;
-            }
-            
-            isSearching = false;
-            showChatScreen();
-            updatePartnerInfo(stranger);
-            listenForMessages(matchId);
-            listenForPartnerPresence(stranger.userId);
-            
-            showToast('Connected with a stranger!', 'success');
         }
         
         // Generate Match ID
